@@ -1,0 +1,214 @@
+#!/bin/bash
+# NAME:  GNOS serve
+# DESC:  Serve current dir using FTP or HTTP and HTTPS
+# FEAT:  HTTP Basic auth
+# FEAT:  Bind IP & TCP port
+# FEAT:  https://ngrok.com reverse-tunneling (requires client)
+# FEAT:  http://serveo.net reverse-tunneling (uses ssh)
+# DEPS:  python
+# DEPS:  sauth      # `sudo pip install sauth`
+# DEPS:  pyftpdlib  # `sudo pip install pyftpdlib`
+# DEPS:  ngrok      # https://ngrok.com/download
+# DEPS:  autossh    # OPTIONAL, degrades to ssh
+# LICE:  WTFPL
+# AUTH:  elias@gnos.in
+
+# TODO:  More checks
+# TODO:  TCP port auto finder
+# TODO:  Fork https://github.com/elfgoh/sauth to implement *OPTIONAL* auth
+
+
+########
+# DEFS #
+########
+
+user=
+pass=
+port=1337    # Default *serving* TCP port
+bind=0.0.0.0 # Listen on *all* interfaces by default
+http=        # non-empty to force HTTP
+ftp=         # non-empty to force FTP
+tunl=        # ngrok: "NGROK" ; serveo: "-" for auto, or custom subdomain
+perms=elr    # FTP perms
+
+########
+# FUNC #
+########
+
+Die () # $*:MSG
+{
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+Usage () # $1:RET
+{
+    cat <<EOF
+Usage: $( basename "$( readlink -f "$BASH_SOURCE" )" ) [options] [ PORT | --ngrok | --serveo [NAME] ]
+
+               PORT    Listening tcp, default: $port
+  -b, --bind   BIND    Listening ip, default: $bind
+  -u, --user   USER    Authentication username
+  -p, --pass   PASS    Authentication password
+  -f, --ftp            Use FTP protocol, read-only
+  -F, --ftpw           Use FTP protocol with WRITE perms
+  -S, --http           Use HTTP protocol instead of HTTPS
+  -N, --ngrok          Use https://ngrok.com reverse-tunneling
+  -n, --serveo [NAME]  Use https://serveo.net reverse-tunneling
+EOF
+    exit $1
+}
+
+
+ServeFtp () # $1:BIND_IP $2:BIND_PORT $3:USER $4:PASS $5:PERMS
+{
+    # DEV if empty user, user=anonymous, password IGNORED
+    # DEV perms: readonly=elr write=elradfmwMT
+    python - "$@" <<'EOPY'
+import sys, os
+from pyftpdlib.authorizers import DummyAuthorizer
+from pyftpdlib.handlers import FTPHandler
+from pyftpdlib.servers import FTPServer
+
+authorizer = DummyAuthorizer()
+if len(sys.argv[3])>0:
+    authorizer.add_user(sys.argv[3], sys.argv[4], os.getcwd(), perm=sys.argv[5])
+else:
+    authorizer.add_anonymous(os.getcwd(), perm=sys.argv[5])
+
+handler = FTPHandler
+handler.authorizer = authorizer
+
+server = FTPServer((sys.argv[1], int(sys.argv[2])), handler)
+print("Serving \"%s\" directory on ftp://%s:%s" % (os.getcwd(), sys.argv[1], sys.argv[2]))
+server.serve_forever()
+EOPY
+}
+
+
+# DEV: sauth does not support auth-less service => minimal python HTTP server
+# BUG: this server only supports HTTP + binding => TODO fork/patch sauth
+ServeHttpNoAuth () # $1:BIND_IP $2:BIND_PORT
+{
+    python - "$1" "$2" <<'EOPY'
+import sys, os, BaseHTTPServer
+from SimpleHTTPServer import SimpleHTTPRequestHandler
+
+def serve(HandlerClass=SimpleHTTPRequestHandler, ServerClass=BaseHTTPServer.HTTPServer):
+    HandlerClass.protocol_version = "HTTP/1.0"
+    httpd = ServerClass((sys.argv[1], int(sys.argv[2])), HandlerClass)
+    print("Serving \"%s\" directory on http://%s:%s" % (os.getcwd(), sys.argv[1], sys.argv[2]))
+    httpd.serve_forever()
+
+if __name__ == "__main__":
+    try:
+        serve()
+    except KeyboardInterrupt:
+        exit
+EOPY
+}
+
+RecursiveKill () # $1:PID $2:SIG
+{   # FROM https://stackoverflow.com/a/42140260
+    local children ret=0 sig=${2:-15}
+
+    kill -SIGSTOP $1 ;
+
+    children=$( ps -o pid --no-headers --ppid $1 )
+
+    for child in $children ; do
+        RecursiveKill $child $sig
+        ret=$(( $ret+$? ))
+    done
+
+    [[ $ret -eq 0 ]] && kill -$sig $1
+
+    kill -SIGCONT $1
+    [[ $ret -eq 0 ]]
+    return $?
+}
+
+
+########
+# INIT #
+########
+
+# Args parser
+while true ; do
+    case $1 in
+        -h|--help)   Usage 0 ;;
+        -u|--user)   [[ $# -ge 2 ]] && { user=$2;  shift 2  ; } || Usage 1 ;;
+        -p|--pass)   [[ $# -ge 2 ]] && { pass=$2;  shift 2  ; } || Usage 1 ;;
+        -b|--bind)   [[ $# -ge 2 ]] && { bind=$2;  shift 2  ; } || Usage 1 ;;
+        -n|--serveo) [[ $# -ge 2 ]] && { tunl=$2;  shift 2  ; } || { tunl=:serveo ; shift ; } ;;
+        -N|--ngrok)  tunl=:ngrok ; shift ;;
+        -S|--http)   http=$1 ; ftp=  ; shift ;;
+        -f|--ftp)    ftp=$1  ; http= ; shift ;;
+        -F|--ftpw)   ftp=$1  ; http= ; perms=elradfmwMT ; shift ;;
+        *) break 2 ;;
+    esac
+done
+[[ -z $tunl && $# -ge 1 ]] && { port=$1 ; shift ; }
+
+# Checks
+[[ $# -eq 0 ]] || Usage 1
+
+if [[ -n $bind ]] ; then
+    :
+    # TODO Check $bind for valid local IP
+fi
+
+if [[ -n $tunl ]] ; then
+    # TODO Autodetect available TCP $port
+    bind=127.0.0.1 # DEV: no need to expose when tunneling
+    if [[ $tunl == :ngrok ]] ; then
+        which ngrok &>/dev/null || Die "Missing ngrok in \$PATH, https://ngrok.com/download"
+    elif [[ $tunl == :serveo ]] ; then
+        : # DEV do nothing
+    else
+        : # TODO Check $tunl for valid subdomain chars
+    fi
+    if [[ -n $ftp ]] ; then
+        Die "FTP protocol does NOT support reverse-tunneling"
+    fi
+fi
+
+if [[ -z $http || -n $user || -n $pass ]] ; then
+    which sauth &>/dev/null || Die "Missing sauth in \$PATH, \`sudo pip3 install sauth\`"
+fi
+
+
+########
+# MAIN #
+########
+
+if [[ -n $ftp ]] ; then
+    ServeFtp "$bind" "$port" "$user" "$pass" "$perms" &
+elif [[ -n $http && -z $user && -z $pass ]] ; then
+    # Serve: authentication-less HTTP
+    ServeHttpNoAuth "$bind" "$port" &
+else
+    # Serve: authentication or/and HTTPS
+    # DEV sauth does not implement *OPTIONAL* auth
+    # BUG sauth => HTTP Basic Auth => empty creds required when none provided
+    sauth $( [[ -z $http && -z $tunl ]] && echo --https ) \
+        "$user" "$pass" "$bind" "$port" &
+fi
+trap "RecursiveKill $! &>/dev/null" INT TERM EXIT QUIT
+
+if [[ -z $tunl ]] ; then
+    wait # DEV foreground server
+    echo -e "\nAborted!"
+    exit
+elif [[ $tunl == :ngrok ]] ; then
+    # Tunnel ngrok HTTP
+    ngrok http "$port"
+    # TODO kill after 8 hours
+else
+    # Tunnel serveo HTTP
+    $( which autossh >/dev/null && echo "autossh -M 0" || echo ssh ) \
+        -R "$( [[ $tunl == :serveo ]] || echo $tunl: )80:$bind:$port" \
+        -o "ServerAliveInterval 30" -o "ServerAliveCountMax 3" \
+        serveo.net
+    # BUG -p 443 => ssh_exchange_identification: Connection closed by remote host
+fi
