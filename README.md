@@ -1,6 +1,6 @@
 # GNOS Serve
 
-Quickly serve current directory to LAN or Internet
+Quickly serve current directory to LAN or the Internet (even behind NAT)
 
 - HTTP/HTTPS + FTP (read-only + write) protocols support
 - HTTP/HTTPS reverse tunneling ([serveo](https://serveo.net) + [ngrok](https://ngrok.com))
@@ -32,5 +32,5 @@ Just copy somewhere in your `$PATH`.
 - python
 - sauth: `sudo pip install sauth`
 - pyftpdlib: `sudo pip install pyftpdlib`
-- ngrok: <https://ngrok.com/download>
 - serveo: `sudo pip install autossh`, OPTIONAL degrades to ssh
+- ngrok, OPTIONAL: <https://ngrok.com/download>
